@@ -2,6 +2,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <string.h>
+#include <stdarg.h>
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -22,17 +27,35 @@
 #define FULL_STEPS 200U
 #define MICROSTEPS 16U
 #define GEAR_RATIO 25U
-#define OUTPUT_ANGLE_DEG 360U  // 1..360, relative angle
-#define DIRECTION 0U          // change to 1 to reverse
-#define TOTAL_PULSES ((FULL_STEPS * MICROSTEPS * GEAR_RATIO * OUTPUT_ANGLE_DEG + 180U) / 360U)
-#define PERIOD_US 1500U       // nominal output speed 0.5 rpm
+#define PPR (FULL_STEPS * MICROSTEPS * GEAR_RATIO)
 #define RAMP_STEPS 400U
 #define BLOCK 32U
 #define CHOPCONF 0x140100C3U
 #define FAULT_MASK 0x1E003000U
+#define LINK_TIMEOUT_US 3000000LL
+static unsigned angle_deg = 360, direction = 0, requested_direction = 0;
+static uint32_t total_pulses = 0, period_us = 1500, sent = 0;
+static bool ready = false, busy = false, pending = false, stop_requested = false, rmt_created = false;
+static int64_t last_ping = 0;
+static char line[96];
+static size_t line_len = 0;
+static bool overflow = false;
 
-_Static_assert(OUTPUT_ANGLE_DEG >= 1 && OUTPUT_ANGLE_DEG <= 360, "Angle must be 1..360");
-_Static_assert(DIRECTION <= 1, "Direction must be 0 or 1");
+// Direct USB Serial/JTAG I/O, not stdin. No infinite write waits.
+static void usb_printf(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        size_t size = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf)-1;
+        (void)usb_serial_jtag_write_bytes(buf, size, pdMS_TO_TICKS(20)+1);
+    }
+}
+#define printf(...) usb_printf(__VA_ARGS__)
+
 static spi_device_handle_t spi;
 static rmt_channel_handle_t tx_channel;
 static rmt_encoder_handle_t encoder;
@@ -108,7 +131,7 @@ static bool healthy(bool enabled)
     uint32_t ds = tmc_read(0x6F);
     if ((io >> 24) != 0x30 || !(io & (1U << 6)) ||
         ((io >> 4) & 1U) != (enabled ? 0U : 1U) ||
-        ((io >> 1) & 1U) != DIRECTION || (gs & 7U) ||
+        ((io >> 1) & 1U) != direction || (gs & 7U) ||
         (ds & FAULT_MASK)) {
         gpio_set_level(PIN_EN, 1);
         printf("FAULT IOIN=%08" PRIX32 " GSTAT=%08" PRIX32 " DRV_STATUS=%08" PRIX32 "\n", io, gs, ds);
@@ -119,12 +142,11 @@ static bool healthy(bool enabled)
 
 static bool tmc_init(void)
 {
-    // Wait for VM, never enable outputs here.
-    while (1) {
-        uint32_t io = tmc_read(0x04);
-        if ((io >> 24) == 0x30 && (io & 0x50U) == 0x50U) break;
-        printf("Waiting for TMC / EN HIGH: IOIN=%08" PRIX32 "\n", io);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // INIT is explicit, and USB remains responsive if VM is off.
+    uint32_t initial_io = tmc_read(0x04);
+    if ((initial_io >> 24) != 0x30 || (initial_io & 0x50U) != 0x50U) {
+        printf("ERR SPI_OR_EN IOIN=%08" PRIX32 "\n", initial_io);
+        return false;
     }
     vTaskDelay(pdMS_TO_TICKS(500));
     tmc_write(0x6C, 0);          // TOFF=0: chopper disabled
@@ -148,7 +170,7 @@ static bool tmc_init(void)
         }
     }
     gpio_set_level(PIN_STEP, 0);
-    gpio_set_level(PIN_DIR, DIRECTION);
+    gpio_set_level(PIN_DIR, direction);
     tmc_write(0x00, 0);          // SpreadCycle, single-edge STEP
     tmc_write(0x0B, 67);         // GLOBALSCALER, ~0.80 A RMS at Rsense=0.075 ohm
     tmc_write(0x10, 0x00061F0A); // IHOLD=10, IRUN=31, IHOLDDELAY=6
@@ -178,74 +200,154 @@ static void rmt_init(void)
 static uint32_t pulse_period(uint32_t index)
 {
     uint32_t edge = index;
-    uint32_t remaining = TOTAL_PULSES - 1U - index;
+    uint32_t remaining = total_pulses - 1U - index;
     if (remaining < edge) edge = remaining;
-    if (edge >= RAMP_STEPS) return PERIOD_US;
-    return PERIOD_US + PERIOD_US * (RAMP_STEPS - edge) / RAMP_STEPS;
+    if (edge >= RAMP_STEPS) return period_us;
+    return period_us + period_us * (RAMP_STEPS - edge) / RAMP_STEPS;
 }
 
-static bool move_once(void)
+static void status(void)
 {
-    uint32_t sent = 0;
+    printf("STATE %s %" PRIu32 " %" PRIu32 "\n",
+           busy ? "MOVING" : ready ? "READY" : "NOT_READY", sent, total_pulses);
+}
+
+static void command(const char *cmd)
+{
+    if (!strcmp(cmd,"HELLO")) {
+        printf("HELLO RMT_GUI_V1\n"); status();
+    } else if (!strcmp(cmd,"PING")) {
+        last_ping = esp_timer_get_time();
+        printf("PONG\n");
+    } else if (!strcmp(cmd,"STATUS")) {
+        status();
+    } else if (!strcmp(cmd,"STOP")) {
+        stop_requested = true; pending = false;
+        gpio_set_level(PIN_EN, 1);
+        printf("OK STOP\n");
+        if (!busy) status();
+    } else if (!strcmp(cmd,"INIT")) {
+        if (busy || pending) { printf("ERR BUSY\n"); return; }
+        gpio_set_level(PIN_EN, 1);
+        if (rmt_created) {
+            // RMT owns STEP after initialization; never rerun GPIO pin test on it.
+            if (ready && healthy(false) && tmc_read(0x6C) == CHOPCONF) {
+                printf("OK INIT\n"); status();
+            } else { ready=false; printf("ERR RESET_REQUIRED\n"); status(); }
+            return;
+        }
+        direction=0; sent=0; total_pulses=0;
+        ready = tmc_init();
+        if (ready) { rmt_init(); rmt_created=true; ready=healthy(false); }
+        if (ready) printf("OK INIT\n"); else printf("ERR INIT_FAILED\n");
+        status();
+    } else {
+        int a, per, d; char extra;
+        if (sscanf(cmd,"MOVE %d %d %d %c", &a, &per, &d, &extra) != 3) {
+            printf("ERR COMMAND\n"); return;
+        }
+        if (busy || pending || !ready) { printf("ERR NOT_READY_OR_BUSY\n"); return; }
+        if (a < 1 || a > 360 || per < 150 || per > 3000 || (d != 0 && d != 1)) {
+            printf("ERR RANGE\n"); return;
+        }
+        if (esp_timer_get_time()-last_ping > LINK_TIMEOUT_US || last_ping == 0) {
+            printf("ERR NO_HEARTBEAT\n"); return;
+        }
+        if (gpio_get_level(PIN_BOOT)==0) { printf("ERR BOOT_HELD\n"); return; }
+        angle_deg=(unsigned)a; period_us=(uint32_t)per;
+        // Set the new direction in move_once, after disabling output.
+        requested_direction=(unsigned)d;
+        total_pulses=(PPR*angle_deg+180U)/360U;
+        sent=0; stop_requested=false; pending=true;
+    }
+}
+
+static void poll_usb(void)
+{
+    char buf[64];
+    // Bounded work per call, even when host sends continuously.
+    for (int pass=0; pass<4; ++pass) {
+        int n=usb_serial_jtag_read_bytes(buf,sizeof(buf),0);
+        if (n<=0) break;
+        for (int i=0; i<n; ++i) {
+            char c=buf[i];
+            if (c=='\n' || c=='\r') {
+                if (!overflow && line_len) { line[line_len]=0; command(line); }
+                line_len=0; overflow=false;
+            } else if (!overflow) {
+                if (line_len<sizeof(line)-1) line[line_len++]=c;
+                else { line_len=0; overflow=true; }
+            }
+        }
+    }
+}
+
+static bool abort_requested(void)
+{
+    return stop_requested || gpio_get_level(PIN_BOOT)==0 ||
+           esp_timer_get_time()-last_ping > LINK_TIMEOUT_US;
+}
+
+static const char *move_once(void)
+{
     rmt_transmit_config_t cfg = {.loop_count = 0, .flags.eot_level = 0};
-    if (!healthy(false)) return false;
+    gpio_set_level(PIN_EN, 1);
+    direction=requested_direction;
+    gpio_set_level(PIN_DIR, direction);
+    vTaskDelay(pdMS_TO_TICKS(20)+1);
+    if (!healthy(false) || tmc_read(0x6C)!=CHOPCONF) { ready=false; return "FAULT"; }
+    if (abort_requested()) return "STOPPED";
     gpio_set_level(PIN_EN, 0);
     vTaskDelay(pdMS_TO_TICKS(200));
-    if (!healthy(true)) return false;
-    printf("START angle=%u pulses=%u\n", OUTPUT_ANGLE_DEG, TOTAL_PULSES);
-    while (sent < TOTAL_PULSES) {
-        if (gpio_get_level(PIN_BOOT) == 0) {
-            gpio_set_level(PIN_EN, 1);
-            printf("STOP: BOOT pressed. Completed pulses=%" PRIu32 "\n", sent);
-            return false;
+    poll_usb();
+    if (abort_requested()) return "STOPPED";
+    if (!healthy(true)) { ready=false; return "FAULT"; }
+    printf("START %u %" PRIu32 " %" PRIu32 " %u\n", angle_deg,total_pulses,period_us,direction);
+    int64_t last_report=esp_timer_get_time();
+    while (sent < total_pulses) {
+        poll_usb();
+        if (abort_requested()) return "STOPPED";
+        if (!healthy(true)) { ready=false; return "FAULT"; }
+        uint32_t n=total_pulses-sent;
+        if(n>BLOCK) n=BLOCK;
+        for(uint32_t i=0;i<n;++i) {
+            symbols[i]=(rmt_symbol_word_t){.level0=1,.duration0=5,
+                .level1=0,.duration1=pulse_period(sent+i)-5};
         }
-        if (!healthy(true)) return false;
-        uint32_t n = TOTAL_PULSES - sent;
-        if (n > BLOCK) n = BLOCK;
-        for (uint32_t i = 0; i < n; ++i) {
-            symbols[i] = (rmt_symbol_word_t){
-                .level0 = 1, .duration0 = 5,
-                .level1 = 0, .duration1 = pulse_period(sent+i)-5,
-            };
+        esp_err_t e=rmt_transmit(tx_channel,encoder,symbols,n*sizeof(symbols[0]),&cfg);
+        if(e==ESP_OK) e=rmt_tx_wait_all_done(tx_channel,1000);
+        if(e!=ESP_OK) {
+            ready=false; gpio_set_level(PIN_EN,1);
+            printf("ERR RMT %s; current block unknown\n",esp_err_to_name(e));
+            return "FAULT";
         }
-        esp_err_t e = rmt_transmit(tx_channel, encoder, symbols,
-                                    n * sizeof(symbols[0]), &cfg);
-        if (e == ESP_OK) e = rmt_tx_wait_all_done(tx_channel, 1000);
-        if (e != ESP_OK) {
-            gpio_set_level(PIN_EN, 1);
-            printf("RMT ERROR: %s; current block position unknown\n", esp_err_to_name(e));
-            return false;
+        sent+=n;
+        if(esp_timer_get_time()-last_report>=500000 || sent==total_pulses) {
+            status(); last_report=esp_timer_get_time();
         }
-        sent += n;
-        if (sent % 8000U == 0 || sent == TOTAL_PULSES)
-            printf("Progress: %" PRIu32 "/%u\n", sent, TOTAL_PULSES);
     }
-    if (!healthy(true)) return false;
-    gpio_set_level(PIN_EN, 1);
-    printf("DONE: %" PRIu32 " pulses; motor disabled\n", sent);
-    return true;
+    if (!healthy(true)) { ready=false; return "FAULT"; }
+    return "DONE";
 }
 
 void app_main(void)
 {
     pins_init();
+    usb_serial_jtag_driver_config_t usb_cfg = {.tx_buffer_size=1024,.rx_buffer_size=1024};
+    checked(usb_serial_jtag_driver_install(&usb_cfg));
+    usb_serial_jtag_vfs_use_driver();
     spi_init();
-    printf("TMC5160 ONE TURN TEST (no GUI)\n");
-    if (!tmc_init()) {
-        gpio_set_level(PIN_EN, 1);
-        printf("INIT FAILED. Fix issue and reset.\n");
-        return;
+    printf("HELLO RMT_GUI_V1\n");
+    while(1) {
+        poll_usb();
+        if (pending) {
+            pending=false; busy=true;
+            const char *result=move_once();
+            gpio_set_level(PIN_EN,1);
+            busy=false;
+            printf("END %s %" PRIu32 "\n",result,sent);
+            status();
+        }
+        vTaskDelay(1);
     }
-    rmt_init();
-    if (!healthy(false)) return;
-    printf("READY. Press and release BOOT to move once.\n");
-    // Require a fresh press after startup. No automatic movement after reset.
-    while (gpio_get_level(PIN_BOOT) == 0) vTaskDelay(pdMS_TO_TICKS(20));
-    while (gpio_get_level(PIN_BOOT) != 0) vTaskDelay(pdMS_TO_TICKS(20));
-    vTaskDelay(pdMS_TO_TICKS(40));
-    while (gpio_get_level(PIN_BOOT) == 0) vTaskDelay(pdMS_TO_TICKS(20));
-    vTaskDelay(pdMS_TO_TICKS(40));
-    move_once();
-    gpio_set_level(PIN_EN, 1);
-    printf("Test ended. RESET to prepare another test.\n");
 }
