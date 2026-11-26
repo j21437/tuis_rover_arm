@@ -12,7 +12,7 @@ PPR = 80000
 class App:
     def __init__(self, root):
         self.root = root
-        root.title('TMC5160 RMT Motor Test | 25:1 | V2.1')
+        root.title('TMC5160 RMT Motor Test | 25:1 | V2.2')
         root.geometry('660x780')
         self.s = None
         self.buf = bytearray()
@@ -216,6 +216,18 @@ class App:
         return bool(ctypes.windll.user32.GetAsyncKeyState(ord(k.upper())) & 0x8000)
 
     @staticmethod
+    def blocked_modifiers(event=None):
+        if sys.platform == 'win32':
+            # Do not interpret Tk's platform-dependent modifier mask as Alt.
+            # High bit = key currently down; ignore toggle/lock bits.
+            user32 = ctypes.windll.user32
+            keys = ((0x11, 'Ctrl'), (0x12, 'Alt'),
+                    (0x5B, 'Left Win'), (0x5C, 'Right Win'))
+            return [name for vk, name in keys
+                    if (user32.GetAsyncKeyState(vk) | user32.GetKeyState(vk)) & 0x8000]
+        return ['Ctrl/Alt'] if event is not None and event.state & 0x000C else []
+
+    @staticmethod
     def mouse_down():
         # Windows GetAsyncKeyState uses physical mouse button codes.
         user32=ctypes.windll.user32
@@ -293,9 +305,11 @@ class App:
         if not self.focus_safe():
             self.logline(f'キー {k.upper()}：入力欄のフォーカスでジョグ禁止')
             return
-        if event.state & 0x000C:
-            self.logline('ジョグ拒否：Ctrl/Alt等の修飾キー')
+        modifiers=self.blocked_modifiers(event)
+        if modifiers:
+            self.logline(f'ジョグ拒否：{", ".join(modifiers)} (state=0x{event.state:04X})')
             return
+        self.logline(f'キー状態: 0x{event.state:04X} / 修飾キーなし')
         self.logline(f'KEY {k.upper()} (code={event.keycode})')
         opposite='a' if k=='d' else 'd'
         if self.jog_key or len(self.keys_down)>1 or (sys.platform=='win32' and self.physical_down(opposite)):
@@ -354,6 +368,9 @@ class App:
             for k in tuple(self.keys_down):
                 if not self.physical_down(k): self.finish_release(k)
             if self.jog_source=='keyboard' and not self.physical_down(self.jog_key): self.stop()
+            if self.jog_source=='keyboard' and self.blocked_modifiers():
+                self.logline('ジョグ停止：修飾キーが押されました')
+                self.stop()
             if self.jog_key and self.physical_down('a') and self.physical_down('d'): self.stop()
             if self.jog_source=='mouse' and any(self.physical_down(k) for k in ('a','d')): self.stop()
         if self.jog_source=='keyboard' and (not self.jog_mode.get() or not self.focus_safe()): self.stop()
