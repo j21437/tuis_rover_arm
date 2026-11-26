@@ -1,6 +1,9 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import time
+import sys
+if sys.platform == "win32":
+    import ctypes
 import serial
 from serial.tools import list_ports
 
@@ -10,7 +13,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title('TMC5160 RMT Motor Test | 25:1')
-        root.geometry('640x650')
+        root.geometry('660x730')
         self.s = None
         self.buf = bytearray()
         self.link = False
@@ -20,6 +23,11 @@ class App:
         self.hello_at = 0
         self.waiting = False
         self.wait_until = 0
+        self.jog_key = None
+        self.keys_down = set()
+        self.release_jobs = {}
+        self.next_jkeep = 0
+        self.jog_mode = tk.BooleanVar(value=False)
         f = ttk.Frame(root, padding=16); f.pack(fill='both', expand=True)
         ttk.Label(f, text='ステッピングモータ テスト', font=('',18,'bold')).pack(anchor='w')
         ttk.Label(f, text='25:1 / 16 microsteps / 80,000 pulses per output revolution').pack(anchor='w',pady=(0,12))
@@ -43,9 +51,18 @@ class App:
         b=ttk.Frame(f); b.pack(fill='x')
         self.go=ttk.Button(b,text='回転開始',command=self.move); self.go.pack(side='left',expand=True,fill='x')
         self.stop_btn=tk.Button(b,text='stop/停止',bg='#a92323',fg='white',command=self.stop); self.stop_btn.pack(side='left',expand=True,fill='x',padx=(8,0))
+        j=ttk.LabelFrame(f,text='手動ジョグ操作（押している間だけ回転）',padding=8); j.pack(fill='x',pady=(10,0))
+        jr=ttk.Frame(j); jr.pack(fill='x')
+        ttk.Checkbutton(jr,text='キーボード操作を有効にする',variable=self.jog_mode,command=self.toggle_jog).pack(side='left')
+        ttk.Button(jr,text='キー操作に戻る',command=self.arm_jog).pack(side='right')
+        ttk.Label(j,text='A：逆転   /   D：正転   ｜   速度は上の設定を使用').pack(anchor='w')
+        ttk.Label(j,text='キーを離す・両方押す・ウィンドウから離れると停止').pack(anchor='w')
         self.bar=ttk.Progressbar(f,maximum=1); self.bar.pack(fill='x',pady=(12,2))
         self.count=tk.StringVar(value='0 / 0 pulses'); ttk.Label(f,textvariable=self.count).pack(anchor='w')
         self.log=tk.Text(f,height=10,wrap='word',font=('Consolas',10)); self.log.pack(fill='both',expand=True,pady=(8,0))
+        root.bind('<KeyPress>',self.key_press,add='+')
+        root.bind('<KeyRelease>',self.key_release,add='+')
+        root.bind('<FocusOut>',self.focus_out,add='+')
         self.refresh(); self.controls(); root.protocol('WM_DELETE_WINDOW',self.close); root.after(40,self.tick)
 
     def refresh(self):
@@ -68,7 +85,7 @@ class App:
         for widget, enabled in (
             (self.connect_btn, self.s is None),
             (self.init_btn, self.link and self.state != 'MOVING' and not self.waiting),
-            (self.go, self.link and self.state == 'READY' and not self.waiting),
+            (self.go, self.link and self.state == 'READY' and not self.waiting and not self.jog_key),
         ):
             if enabled and widget.instate(['disabled']):
                 widget.state(['!disabled'])
@@ -97,11 +114,12 @@ class App:
         try:
             data=(cmd+'\n').encode('ascii')
             if self.s.write(data)!=len(data): raise serial.SerialTimeoutException('partial write')
-            if cmd!='PING': self.logline('> '+cmd)
+            if cmd not in ('PING','JKEEP'): self.logline('> '+cmd)
             return True
         except (serial.SerialException,OSError) as e:
             self.logline('通信エラー: '+str(e)); self.disconnect(send_stop=False); return False
     def disconnect(self,send_stop=True):
+        self.jog_key=None; self.jog_mode.set(False)
         s=self.s
         if s and send_stop:
             try: s.write(b'STOP\n')
@@ -114,40 +132,131 @@ class App:
     def initialize(self):
         if self.send('INIT'): self.waiting=True; self.wait_until=time.monotonic()+4; self.controls()
     def move(self):
-        if not self.s or not self.link or self.state != 'READY' or self.waiting:
+        if not self.s or not self.link or self.state != 'READY' or self.waiting or self.jog_key:
             return
         try: a,p,d=self.params()
         except (ValueError,OverflowError): messagebox.showerror('入力エラー','角度1～360°、速度0.25～5rpm'); return
         if self.send(f'MOVE {a} {p} {d}'):
             self.waiting=True; self.wait_until=time.monotonic()+3; self.status.set('回転指令送信済み / 応答待ち'); self.controls()
     def stop(self):
+        self.jog_key=None
         if self.send('STOP'): self.waiting=True; self.wait_until=time.monotonic()+3; self.controls()
     def receive(self,msg):
         if msg!='PONG': self.logline(msg)
-        if msg=='HELLO RMT_GUI_V1':
+        if msg=='HELLO RMT_GUI_V2':
             self.link=True; self.last_rx=time.monotonic(); self.status.set('通信OK / 初期化してください'); self.send('STATUS')
+        elif msg.startswith('HELLO '):
+            self.logline('ファームウェアのバージョン不一致。V2を書き込んでください。'); self.disconnect()
         elif msg=='PONG':
             self.last_rx=time.monotonic()
             return
         elif msg.startswith('STATE '):
             parts=msg.split()
             if len(parts)==4 and parts[1] in ('READY','MOVING','NOT_READY'):
-                try: n,total=map(int,parts[2:]); self.bar['maximum']=max(1,total); self.bar['value']=n; self.count.set(f'{n:,} / {total:,} pulses')
+                try:
+                    n,total=map(int,parts[2:])
+                    self.bar['maximum']=max(1,total); self.bar['value']=n if total else 0
+                    self.count.set(f'{n:,} / {total:,} pulses' if total else f'{n:,} pulses（ジョグ）' if n or parts[1]=='MOVING' else '0 pulses')
                 except ValueError: return
                 self.state=parts[1]; self.waiting=False
+                if self.state=='NOT_READY': self.jog_key=None
                 self.status.set({'READY':'READY / 回転可能','MOVING':'回転中','NOT_READY':'初期化が必要'}[self.state])
         elif msg.startswith('START '): self.state='MOVING'; self.waiting=False; self.status.set('回転中')
         elif msg.startswith('ERR '):
+            if self.jog_key: self.stop()
             self.waiting=False; self.status.set(msg)
             if self.state!='MOVING': self.state='NOT_READY'
-        elif msg.startswith('END '): self.waiting=False; self.status.set(msg); self.state='NOT_READY'
+        elif msg.startswith('END '): self.jog_key=None; self.waiting=False; self.status.set(msg); self.state='NOT_READY'
         self.controls()
+    def arm_jog(self):
+        self.jog_mode.set(True); self.toggle_jog()
+
+    def toggle_jog(self):
+        if not self.jog_mode.get():
+            if self.jog_key: self.stop()
+        else:
+            if sys.platform=='win32':
+                self.keys_down.update(k for k in ('a','d') if self.physical_down(k))
+            self.root.focus_set()
+            self.logline('ジョグ有効：A / D を押している間だけ回転')
+
+    @staticmethod
+    def physical_down(k):
+        return bool(ctypes.windll.user32.GetAsyncKeyState(ord(k.upper())) & 0x8000)
+
+    def focus_widget(self):
+        try: return self.root.focus_get()
+        except (KeyError,tk.TclError): return None
+
+    def focus_safe(self):
+        w=self.focus_widget()
+        return (w is not None and w.winfo_toplevel()==self.root
+                and w.winfo_class() not in ('Entry','TEntry','TCombobox','Text','Spinbox','TSpinbox'))
+
+    def focus_out(self,event):
+        self.root.after_idle(self.check_focus)
+
+    def check_focus(self):
+        if self.jog_key and not self.focus_safe(): self.stop()
+        if self.focus_widget() is None:
+            self.jog_mode.set(False)
+
+    def key_press(self,event):
+        k=event.keysym.lower()
+        if k not in ('a','d'): return
+        if k in self.release_jobs:
+            self.root.after_cancel(self.release_jobs.pop(k))
+        if k in self.keys_down:
+            return 'break' if self.jog_mode.get() and self.focus_safe() else None
+        self.keys_down.add(k)
+        if not self.jog_mode.get() or not self.focus_safe() or event.state & 0x000C: return
+        opposite='a' if k=='d' else 'd'
+        if self.jog_key or len(self.keys_down)>1 or (sys.platform=='win32' and self.physical_down(opposite)):
+            if self.jog_key: self.stop()
+            return 'break'
+        if not self.s or not self.link or self.state!='READY' or self.waiting: return 'break'
+        try:
+            r=float(self.rpm.get())
+            if not 0.25<=r<=5: raise ValueError()
+            p=round(750/r)
+        except (ValueError,OverflowError):
+            self.status.set('速度0.25～5rpmを指定してください'); return 'break'
+        if self.send(f'JOG {p} {0 if k=="d" else 1}'):
+            self.jog_key=k; self.next_jkeep=time.monotonic()+.12
+            self.waiting=True; self.wait_until=time.monotonic()+3
+            self.status.set('ジョグ指令送信済み / 応答待ち'); self.controls()
+        return 'break'
+
+    def key_release(self,event):
+        k=event.keysym.lower()
+        if k not in ('a','d'): return
+        if sys.platform=='win32': self.finish_release(k)
+        else:
+            # X11 auto-repeat may emit synthetic release/press pairs.
+            if k in self.release_jobs: self.root.after_cancel(self.release_jobs[k])
+            self.release_jobs[k]=self.root.after(35,lambda: self.finish_release(k))
+        if self.jog_mode.get() and self.focus_safe(): return 'break'
+
+    def finish_release(self,k):
+        self.release_jobs.pop(k,None); self.keys_down.discard(k)
+        if self.jog_key==k: self.stop()
+
     def tick(self):
+        if sys.platform=='win32':
+            # Physical key state is a fallback when Tk misses KeyRelease.
+            for k in tuple(self.keys_down):
+                if not self.physical_down(k):
+                    self.finish_release(k)
+            if self.jog_key and self.physical_down('a') and self.physical_down('d'):
+                self.stop()
+        if self.jog_key and (not self.jog_mode.get() or not self.focus_safe()): self.stop()
         if self.s:
             try:
                 now=time.monotonic()
                 if self.hello_at and now>=self.hello_at:
                     self.hello_at=0; self.send('HELLO')
+                if self.s and self.jog_key and now>=self.next_jkeep:
+                    self.next_jkeep=now+.12; self.send('JKEEP')
                 if self.s and now>=self.next_ping and not self.hello_at:
                     self.next_ping=now+.5; self.send('PING')
                 if self.s:

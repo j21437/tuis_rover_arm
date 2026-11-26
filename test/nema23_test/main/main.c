@@ -33,10 +33,13 @@
 #define CHOPCONF 0x140100C3U
 #define FAULT_MASK 0x1E003000U
 #define LINK_TIMEOUT_US 3000000LL
+#define JOG_TIMEOUT_US 650000LL
+#define JOG_BLOCK_US 20000U
 static unsigned angle_deg = 360, direction = 0, requested_direction = 0;
 static uint32_t total_pulses = 0, period_us = 1500, sent = 0;
 static bool ready = false, busy = false, pending = false, stop_requested = false, rmt_created = false;
-static int64_t last_ping = 0;
+static int64_t last_ping = 0, last_jog_keep = 0;
+static bool jogging = false;
 static char line[96];
 static size_t line_len = 0;
 static bool overflow = false;
@@ -200,8 +203,10 @@ static void rmt_init(void)
 static uint32_t pulse_period(uint32_t index)
 {
     uint32_t edge = index;
-    uint32_t remaining = total_pulses - 1U - index;
-    if (remaining < edge) edge = remaining;
+    if (!jogging) {
+        uint32_t remaining = total_pulses - 1U - index;
+        if (remaining < edge) edge = remaining;
+    }
     if (edge >= RAMP_STEPS) return period_us;
     return period_us + period_us * (RAMP_STEPS - edge) / RAMP_STEPS;
 }
@@ -215,17 +220,21 @@ static void status(void)
 static void command(const char *cmd)
 {
     if (!strcmp(cmd,"HELLO")) {
-        printf("HELLO RMT_GUI_V1\n"); status();
+        printf("HELLO RMT_GUI_V2\n"); status();
     } else if (!strcmp(cmd,"PING")) {
         last_ping = esp_timer_get_time();
         printf("PONG\n");
+    } else if (!strcmp(cmd,"JKEEP")) {
+        if (jogging && (busy || pending) && !stop_requested &&
+            esp_timer_get_time()-last_jog_keep <= JOG_TIMEOUT_US)
+            last_jog_keep = esp_timer_get_time();
     } else if (!strcmp(cmd,"STATUS")) {
         status();
     } else if (!strcmp(cmd,"STOP")) {
         stop_requested = true; pending = false;
         gpio_set_level(PIN_EN, 1);
         printf("OK STOP\n");
-        if (!busy) status();
+        if (!busy) { jogging=false; status(); }
     } else if (!strcmp(cmd,"INIT")) {
         if (busy || pending) { printf("ERR BUSY\n"); return; }
         gpio_set_level(PIN_EN, 1);
@@ -242,12 +251,13 @@ static void command(const char *cmd)
         if (ready) printf("OK INIT\n"); else printf("ERR INIT_FAILED\n");
         status();
     } else {
-        int a, per, d; char extra;
-        if (sscanf(cmd,"MOVE %d %d %d %c", &a, &per, &d, &extra) != 3) {
+        int a=0, per, d; char extra;
+        bool jog_cmd = sscanf(cmd,"JOG %d %d %c", &per, &d, &extra) == 2;
+        if (!jog_cmd && sscanf(cmd,"MOVE %d %d %d %c", &a, &per, &d, &extra) != 3) {
             printf("ERR COMMAND\n"); return;
         }
         if (busy || pending || !ready) { printf("ERR NOT_READY_OR_BUSY\n"); return; }
-        if (a < 1 || a > 360 || per < 150 || per > 3000 || (d != 0 && d != 1)) {
+        if ((!jog_cmd && (a < 1 || a > 360)) || per < 150 || per > 3000 || (d != 0 && d != 1)) {
             printf("ERR RANGE\n"); return;
         }
         if (esp_timer_get_time()-last_ping > LINK_TIMEOUT_US || last_ping == 0) {
@@ -257,7 +267,9 @@ static void command(const char *cmd)
         angle_deg=(unsigned)a; period_us=(uint32_t)per;
         // Set the new direction in move_once, after disabling output.
         requested_direction=(unsigned)d;
-        total_pulses=(PPR*angle_deg+180U)/360U;
+        jogging=jog_cmd;
+        last_jog_keep=esp_timer_get_time();
+        total_pulses=jogging ? 0 : (PPR*angle_deg+180U)/360U;
         sent=0; stop_requested=false; pending=true;
     }
 }
@@ -285,7 +297,20 @@ static void poll_usb(void)
 static bool abort_requested(void)
 {
     return stop_requested || gpio_get_level(PIN_BOOT)==0 ||
-           esp_timer_get_time()-last_ping > LINK_TIMEOUT_US;
+           esp_timer_get_time()-last_ping > LINK_TIMEOUT_US ||
+           (jogging && esp_timer_get_time()-last_jog_keep > JOG_TIMEOUT_US);
+}
+
+static bool wait_motion_ms(unsigned ms)
+{
+    int64_t end = esp_timer_get_time() + (int64_t)ms * 1000;
+    do {
+        poll_usb();
+        if (abort_requested()) return false;
+        vTaskDelay(1);
+    } while (esp_timer_get_time() < end);
+    poll_usb();
+    return !abort_requested();
 }
 
 static const char *move_once(void)
@@ -294,25 +319,29 @@ static const char *move_once(void)
     gpio_set_level(PIN_EN, 1);
     direction=requested_direction;
     gpio_set_level(PIN_DIR, direction);
-    vTaskDelay(pdMS_TO_TICKS(20)+1);
+    if (!wait_motion_ms(20)) return "STOPPED";
     if (!healthy(false) || tmc_read(0x6C)!=CHOPCONF) { ready=false; return "FAULT"; }
     if (abort_requested()) return "STOPPED";
     gpio_set_level(PIN_EN, 0);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    if (!wait_motion_ms(200)) return "STOPPED";
     poll_usb();
     if (abort_requested()) return "STOPPED";
     if (!healthy(true)) { ready=false; return "FAULT"; }
     printf("START %u %" PRIu32 " %" PRIu32 " %u\n", angle_deg,total_pulses,period_us,direction);
     int64_t last_report=esp_timer_get_time();
-    while (sent < total_pulses) {
+    while (jogging || sent < total_pulses) {
         poll_usb();
         if (abort_requested()) return "STOPPED";
         if (!healthy(true)) { ready=false; return "FAULT"; }
-        uint32_t n=total_pulses-sent;
+        uint32_t n;
+        if (jogging) {
+            n=JOG_BLOCK_US/pulse_period(sent);
+            if (n==0) n=1;
+        } else n=total_pulses-sent;
         if(n>BLOCK) n=BLOCK;
         for(uint32_t i=0;i<n;++i) {
             symbols[i]=(rmt_symbol_word_t){.level0=1,.duration0=5,
-                .level1=0,.duration1=pulse_period(sent+i)-5};
+                .level1=0,.duration1=pulse_period(jogging && sent>=RAMP_STEPS ? RAMP_STEPS : sent+i)-5};
         }
         esp_err_t e=rmt_transmit(tx_channel,encoder,symbols,n*sizeof(symbols[0]),&cfg);
         if(e==ESP_OK) e=rmt_tx_wait_all_done(tx_channel,1000);
@@ -321,7 +350,8 @@ static const char *move_once(void)
             printf("ERR RMT %s; current block unknown\n",esp_err_to_name(e));
             return "FAULT";
         }
-        sent+=n;
+        if (UINT32_MAX-sent<n) sent=UINT32_MAX;
+        else sent+=n;
         if(esp_timer_get_time()-last_report>=500000 || sent==total_pulses) {
             status(); last_report=esp_timer_get_time();
         }
@@ -337,14 +367,14 @@ void app_main(void)
     checked(usb_serial_jtag_driver_install(&usb_cfg));
     usb_serial_jtag_vfs_use_driver();
     spi_init();
-    printf("HELLO RMT_GUI_V1\n");
+    printf("HELLO RMT_GUI_V2\n");
     while(1) {
         poll_usb();
         if (pending) {
             pending=false; busy=true;
             const char *result=move_once();
             gpio_set_level(PIN_EN,1);
-            busy=false;
+            busy=false; jogging=false;
             printf("END %s %" PRIu32 "\n",result,sent);
             status();
         }

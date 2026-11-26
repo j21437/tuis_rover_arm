@@ -9,8 +9,8 @@ try:
     while time.monotonic()<end:
         line=s.readline().decode('utf-8','replace').strip()
         if line: print(line);ok.add(line)
-        if {'HELLO RMT_GUI_V1','PONG'}<=ok: break
-    print('USB OK' if {'HELLO RMT_GUI_V1','PONG'}<=ok else 'USB FAILED: expected HELLO and PONG')
+        if {'HELLO RMT_GUI_V2','PONG'}<=ok: break
+    print('USB OK' if {'HELLO RMT_GUI_V2','PONG'}<=ok else 'USB FAILED: expected HELLO and PONG')
 except (serial.SerialException,OSError) as e:
     print('USB FAILED:',e)
 finally:
