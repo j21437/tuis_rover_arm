@@ -12,8 +12,8 @@ PPR = 80000
 class App:
     def __init__(self, root):
         self.root = root
-        root.title('TMC5160 RMT Motor Test | 25:1')
-        root.geometry('660x730')
+        root.title('TMC5160 RMT Motor Test | 25:1 | V2.2')
+        root.geometry('660x780')
         self.s = None
         self.buf = bytearray()
         self.link = False
@@ -24,6 +24,8 @@ class App:
         self.waiting = False
         self.wait_until = 0
         self.jog_key = None
+        self.jog_source = None
+        self.mouse_button = None
         self.keys_down = set()
         self.release_jobs = {}
         self.next_jkeep = 0
@@ -57,12 +59,27 @@ class App:
         ttk.Button(jr,text='キー操作に戻る',command=self.arm_jog).pack(side='right')
         ttk.Label(j,text='A：逆転   /   D：正転   ｜   速度は上の設定を使用').pack(anchor='w')
         ttk.Label(j,text='キーを離す・両方押す・ウィンドウから離れると停止').pack(anchor='w')
+        self.key_pad=ttk.Label(j,text='キー操作エリア（ここをクリックしてA / D）',takefocus=True,relief='groove',padding=5)
+        self.key_pad.pack(fill='x',pady=(4,0))
+        self.key_pad.bind('<Button-1>',lambda event:self.arm_jog())
+        mouse_row=ttk.Frame(j); mouse_row.pack(fill='x',pady=(6,0))
+        self.jog_buttons={}
+        for k,label in (('a','← 逆転（長押し）'),('d','正転（長押し） →')):
+            button=ttk.Button(mouse_row,text=label,takefocus=True)
+            button.pack(side='left',expand=True,fill='x',padx=3,ipady=8)
+            self.jog_buttons[k]=button
+            button.bind('<ButtonPress-1>',lambda event,k=k:self.mouse_press(event,k))
+            button.bind('<ButtonRelease-1>',self.mouse_release)
+            button.bind('<Leave>',self.mouse_leave)
+        ttk.Label(j,text='マウスはチェック不要。ボタンを離す / 枠外に出ると停止。').pack(anchor='w')
         self.bar=ttk.Progressbar(f,maximum=1); self.bar.pack(fill='x',pady=(12,2))
         self.count=tk.StringVar(value='0 / 0 pulses'); ttk.Label(f,textvariable=self.count).pack(anchor='w')
         self.log=tk.Text(f,height=10,wrap='word',font=('Consolas',10)); self.log.pack(fill='both',expand=True,pady=(8,0))
         root.bind('<KeyPress>',self.key_press,add='+')
         root.bind('<KeyRelease>',self.key_release,add='+')
         root.bind('<FocusOut>',self.focus_out,add='+')
+        root.bind('<ButtonRelease-1>',self.mouse_release,add='+')
+        root.bind('<Unmap>',self.window_unmap,add='+')
         self.refresh(); self.controls(); root.protocol('WM_DELETE_WINDOW',self.close); root.after(40,self.tick)
 
     def refresh(self):
@@ -84,13 +101,19 @@ class App:
         # Leave Tk's mouse hover and pressed states alone.
         for widget, enabled in (
             (self.connect_btn, self.s is None),
-            (self.init_btn, self.link and self.state != 'MOVING' and not self.waiting),
+            (self.init_btn, self.link and self.state != 'MOVING' and not self.waiting and not self.jog_key),
             (self.go, self.link and self.state == 'READY' and not self.waiting and not self.jog_key),
         ):
             if enabled and widget.instate(['disabled']):
                 widget.state(['!disabled'])
             elif not enabled and widget.instate(['!disabled']):
                 widget.state(['disabled'])
+        ready = bool(self.s and self.link and self.state == 'READY' and not self.waiting and not self.jog_key)
+        for k, button in self.jog_buttons.items():
+            active = self.jog_source == 'mouse' and self.jog_key == k
+            enabled = ready or active
+            if enabled and button.instate(['disabled']): button.state(['!disabled'])
+            elif not enabled and button.instate(['!disabled']): button.state(['disabled'])
         desired = 'normal' if self.s else 'disabled'
         if str(self.stop_btn.cget('state')) == 'disabled' and desired == 'normal':
             self.stop_btn.configure(state=desired)
@@ -119,7 +142,7 @@ class App:
         except (serial.SerialException,OSError) as e:
             self.logline('通信エラー: '+str(e)); self.disconnect(send_stop=False); return False
     def disconnect(self,send_stop=True):
-        self.jog_key=None; self.jog_mode.set(False)
+        self.clear_jog(); self.jog_mode.set(False)
         s=self.s
         if s and send_stop:
             try: s.write(b'STOP\n')
@@ -138,8 +161,13 @@ class App:
         except (ValueError,OverflowError): messagebox.showerror('入力エラー','角度1～360°、速度0.25～5rpm'); return
         if self.send(f'MOVE {a} {p} {d}'):
             self.waiting=True; self.wait_until=time.monotonic()+3; self.status.set('回転指令送信済み / 応答待ち'); self.controls()
-    def stop(self):
+    def clear_jog(self):
         self.jog_key=None
+        self.jog_source=None
+        self.mouse_button=None
+
+    def stop(self):
+        self.clear_jog()
         if self.send('STOP'): self.waiting=True; self.wait_until=time.monotonic()+3; self.controls()
     def receive(self,msg):
         if msg!='PONG': self.logline(msg)
@@ -158,31 +186,53 @@ class App:
                     self.bar['maximum']=max(1,total); self.bar['value']=n if total else 0
                     self.count.set(f'{n:,} / {total:,} pulses' if total else f'{n:,} pulses（ジョグ）' if n or parts[1]=='MOVING' else '0 pulses')
                 except ValueError: return
+                previous=self.state
                 self.state=parts[1]; self.waiting=False
-                if self.state=='NOT_READY': self.jog_key=None
+                if self.state=='NOT_READY' or (previous=='MOVING' and self.state=='READY'):
+                    self.clear_jog()
                 self.status.set({'READY':'READY / 回転可能','MOVING':'回転中','NOT_READY':'初期化が必要'}[self.state])
         elif msg.startswith('START '): self.state='MOVING'; self.waiting=False; self.status.set('回転中')
         elif msg.startswith('ERR '):
             if self.jog_key: self.stop()
             self.waiting=False; self.status.set(msg)
             if self.state!='MOVING': self.state='NOT_READY'
-        elif msg.startswith('END '): self.jog_key=None; self.waiting=False; self.status.set(msg); self.state='NOT_READY'
+        elif msg.startswith('END '): self.clear_jog(); self.waiting=False; self.status.set(msg); self.state='NOT_READY'
         self.controls()
     def arm_jog(self):
         self.jog_mode.set(True); self.toggle_jog()
 
     def toggle_jog(self):
         if not self.jog_mode.get():
-            if self.jog_key: self.stop()
+            if self.jog_source == 'keyboard': self.stop()
         else:
             if sys.platform=='win32':
-                self.keys_down.update(k for k in ('a','d') if self.physical_down(k))
-            self.root.focus_set()
+                # Keys already held when arming must be released before use.
+                self.keys_down = {k for k in ('a','d') if self.physical_down(k)}
+            self.key_pad.focus_set()
             self.logline('ジョグ有効：A / D を押している間だけ回転')
 
     @staticmethod
     def physical_down(k):
         return bool(ctypes.windll.user32.GetAsyncKeyState(ord(k.upper())) & 0x8000)
+
+    @staticmethod
+    def blocked_modifiers(event=None):
+        if sys.platform == 'win32':
+            # Do not interpret Tk's platform-dependent modifier mask as Alt.
+            # High bit = key currently down; ignore toggle/lock bits.
+            user32 = ctypes.windll.user32
+            keys = ((0x11, 'Ctrl'), (0x12, 'Alt'),
+                    (0x5B, 'Left Win'), (0x5C, 'Right Win'))
+            return [name for vk, name in keys
+                    if (user32.GetAsyncKeyState(vk) | user32.GetKeyState(vk)) & 0x8000]
+        return ['Ctrl/Alt'] if event is not None and event.state & 0x000C else []
+
+    @staticmethod
+    def mouse_down():
+        # Windows GetAsyncKeyState uses physical mouse button codes.
+        user32=ctypes.windll.user32
+        vk=0x02 if user32.GetSystemMetrics(23) else 0x01
+        return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
     def focus_widget(self):
         try: return self.root.focus_get()
@@ -201,35 +251,77 @@ class App:
         if self.focus_widget() is None:
             self.jog_mode.set(False)
 
-    def key_press(self,event):
-        k=event.keysym.lower()
-        if k not in ('a','d'): return
-        if k in self.release_jobs:
-            self.root.after_cancel(self.release_jobs.pop(k))
-        if k in self.keys_down:
-            return 'break' if self.jog_mode.get() and self.focus_safe() else None
-        self.keys_down.add(k)
-        if not self.jog_mode.get() or not self.focus_safe() or event.state & 0x000C: return
-        opposite='a' if k=='d' else 'd'
-        if self.jog_key or len(self.keys_down)>1 or (sys.platform=='win32' and self.physical_down(opposite)):
+    def window_unmap(self,event):
+        if event.widget is self.root:
             if self.jog_key: self.stop()
-            return 'break'
-        if not self.s or not self.link or self.state!='READY' or self.waiting: return 'break'
+            self.jog_mode.set(False)
+
+    def start_jog(self,k,source,button=None):
+        if self.jog_key:
+            self.stop()
+            return False
+        if not self.focus_safe():
+            self.logline('ジョグ拒否：入力欄またはウィンドウのフォーカスを確認')
+            return False
+        if not self.s or not self.link or self.state!='READY' or self.waiting:
+            self.logline(f'ジョグ拒否：READY待ち (state={self.state}, waiting={self.waiting})')
+            return False
         try:
             r=float(self.rpm.get())
             if not 0.25<=r<=5: raise ValueError()
             p=round(750/r)
         except (ValueError,OverflowError):
-            self.status.set('速度0.25～5rpmを指定してください'); return 'break'
-        if self.send(f'JOG {p} {0 if k=="d" else 1}'):
-            self.jog_key=k; self.next_jkeep=time.monotonic()+.12
-            self.waiting=True; self.wait_until=time.monotonic()+3
-            self.status.set('ジョグ指令送信済み / 応答待ち'); self.controls()
+            self.status.set('速度0.25～5rpmを指定してください')
+            self.logline('ジョグ拒否：速度設定が範囲外')
+            return False
+        if not self.send(f'JOG {p} {0 if k=="d" else 1}'): return False
+        self.jog_key=k; self.jog_source=source; self.mouse_button=button
+        self.next_jkeep=time.monotonic()+.12
+        self.waiting=True; self.wait_until=time.monotonic()+3
+        self.status.set('ジョグ指令送信済み / 応答待ち'); self.controls()
+        return True
+
+    @staticmethod
+    def event_key(event):
+        k=event.keysym.lower()
+        if k in ('a','d'): return k
+        if sys.platform=='win32': return {65:'a',68:'d'}.get(event.keycode)
+        return None
+
+    def key_press(self,event):
+        k=self.event_key(event)
+        if k is None: return
+        if k in self.release_jobs:
+            self.root.after_cancel(self.release_jobs.pop(k))
+        if k in self.keys_down:
+            return 'break' if self.jog_mode.get() and self.focus_safe() else None
+        self.keys_down.add(k)
+        # Any new A/D press during mouse jog stops it, never reverses it.
+        if self.jog_source=='mouse':
+            self.stop(); return 'break'
+        if not self.jog_mode.get():
+            self.logline(f'キー {k.upper()}：キーボード操作が無効')
+            return
+        if not self.focus_safe():
+            self.logline(f'キー {k.upper()}：入力欄のフォーカスでジョグ禁止')
+            return
+        modifiers=self.blocked_modifiers(event)
+        if modifiers:
+            self.logline(f'ジョグ拒否：{", ".join(modifiers)} (state=0x{event.state:04X})')
+            return
+        self.logline(f'キー状態: 0x{event.state:04X} / 修飾キーなし')
+        self.logline(f'KEY {k.upper()} (code={event.keycode})')
+        opposite='a' if k=='d' else 'd'
+        if self.jog_key or len(self.keys_down)>1 or (sys.platform=='win32' and self.physical_down(opposite)):
+            if self.jog_key: self.stop()
+            self.logline('ジョグ拒否：両方のキーを離してから操作')
+            return 'break'
+        self.start_jog(k,'keyboard')
         return 'break'
 
     def key_release(self,event):
-        k=event.keysym.lower()
-        if k not in ('a','d'): return
+        k=self.event_key(event)
+        if k is None: return
         if sys.platform=='win32': self.finish_release(k)
         else:
             # X11 auto-repeat may emit synthetic release/press pairs.
@@ -239,17 +331,50 @@ class App:
 
     def finish_release(self,k):
         self.release_jobs.pop(k,None); self.keys_down.discard(k)
-        if self.jog_key==k: self.stop()
+        if self.jog_source=='keyboard' and self.jog_key==k: self.stop()
+
+    def mouse_press(self,event,k):
+        button=event.widget
+        if self.jog_key:
+            self.stop(); return 'break'
+        if button.instate(['disabled']): return 'break'
+        if self.keys_down or (sys.platform=='win32' and any(self.physical_down(x) for x in ('a','d'))):
+            self.logline('ジョグ拒否：A/Dキーを離してください'); return 'break'
+        button.focus_set()
+        self.logline(f'MOUSE {k.upper()}')
+        self.start_jog(k,'mouse',button)
+        return 'break'
+
+    def mouse_release(self,event):
+        if self.jog_source=='mouse':
+            self.stop()
+            return 'break'
+        if event.widget in self.jog_buttons.values(): return 'break'
+
+    def mouse_leave(self,event):
+        if self.jog_source=='mouse' and event.widget is self.mouse_button:
+            self.stop()
+
+    def mouse_safe(self):
+        b=self.mouse_button
+        if b is None or not self.focus_safe() or not b.winfo_viewable(): return False
+        x,y=b.winfo_pointerxy()
+        return (b.winfo_rootx() <= x < b.winfo_rootx()+b.winfo_width()
+                and b.winfo_rooty() <= y < b.winfo_rooty()+b.winfo_height()
+                and (sys.platform!='win32' or self.mouse_down()))
 
     def tick(self):
         if sys.platform=='win32':
-            # Physical key state is a fallback when Tk misses KeyRelease.
             for k in tuple(self.keys_down):
-                if not self.physical_down(k):
-                    self.finish_release(k)
-            if self.jog_key and self.physical_down('a') and self.physical_down('d'):
+                if not self.physical_down(k): self.finish_release(k)
+            if self.jog_source=='keyboard' and not self.physical_down(self.jog_key): self.stop()
+            if self.jog_source=='keyboard' and self.blocked_modifiers():
+                self.logline('ジョグ停止：修飾キーが押されました')
                 self.stop()
-        if self.jog_key and (not self.jog_mode.get() or not self.focus_safe()): self.stop()
+            if self.jog_key and self.physical_down('a') and self.physical_down('d'): self.stop()
+            if self.jog_source=='mouse' and any(self.physical_down(k) for k in ('a','d')): self.stop()
+        if self.jog_source=='keyboard' and (not self.jog_mode.get() or not self.focus_safe()): self.stop()
+        if self.jog_source=='mouse' and not self.mouse_safe(): self.stop()
         if self.s:
             try:
                 now=time.monotonic()
