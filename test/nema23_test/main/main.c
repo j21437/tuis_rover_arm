@@ -35,11 +35,21 @@
 #define LINK_TIMEOUT_US 3000000LL
 #define JOG_TIMEOUT_US 650000LL
 #define JOG_BLOCK_US 20000U
+#define HOLD_CHECK_US 100000LL
+// Nominal RMS phase-current presets; Rsense=0.075 ohm, Vfs=0.325 V.
+// IRUN=IHOLD=31. GLOBALSCALER is never zero (zero means full scale).
+#define MAX_GLOBALSCALER 166U
+#define DEFAULT_CURRENT_MA 500U
+static unsigned current_ma = DEFAULT_CURRENT_MA;
+static unsigned current_scaler = 41U;
+_Static_assert(MAX_GLOBALSCALER < 256U, "GLOBALSCALER range");
 static unsigned angle_deg = 360, direction = 0, requested_direction = 0;
 static uint32_t total_pulses = 0, period_us = 1500, sent = 0;
 static bool ready = false, busy = false, pending = false, stop_requested = false, rmt_created = false;
 static int64_t last_ping = 0, last_jog_keep = 0;
 static bool jogging = false;
+static bool hold_mode = false, jog_stop_requested = false;
+static int64_t last_hold_check = 0;
 static char line[96];
 static size_t line_len = 0;
 static bool overflow = false;
@@ -175,8 +185,8 @@ static bool tmc_init(void)
     gpio_set_level(PIN_STEP, 0);
     gpio_set_level(PIN_DIR, direction);
     tmc_write(0x00, 0);          // SpreadCycle, single-edge STEP
-    tmc_write(0x0B, 67);         // GLOBALSCALER, ~0.80 A RMS at Rsense=0.075 ohm
-    tmc_write(0x10, 0x00061F0A); // IHOLD=10, IRUN=31, IHOLDDELAY=6
+    tmc_write(0x0B, current_scaler);
+    tmc_write(0x10, 0x00061F1FU); // IHOLD=31, IRUN=31, IHOLDDELAY=6
     tmc_write(0x11, 10);
     tmc_write(0x6D, 0);          // CoolStep off
     tmc_write(0x6C, CHOPCONF);   // MRES=4 (16), interpolation on, TOFF=3
@@ -214,41 +224,130 @@ static uint32_t pulse_period(uint32_t index)
 static void status(void)
 {
     printf("STATE %s %" PRIu32 " %" PRIu32 "\n",
-           busy ? "MOVING" : ready ? "READY" : "NOT_READY", sent, total_pulses);
+           busy ? "MOVING" : ready ? (hold_mode ? "HOLDING" : "READY") : "NOT_READY", sent, total_pulses);
+}
+
+static bool link_alive(void)
+{
+    return last_ping != 0 && esp_timer_get_time()-last_ping <= LINK_TIMEOUT_US;
+}
+
+static void release_output(void)
+{
+    hold_mode=false;
+    gpio_set_level(PIN_EN, 1);
+}
+
+// Idle holding is monitored independently of motion.
+static void monitor_hold(void)
+{
+    if (!hold_mode || busy) return;
+    const char *reason=NULL;
+    if (gpio_get_level(PIN_BOOT)==0) reason="BOOT";
+    else if (!link_alive()) reason="LINK_TIMEOUT";
+    else if (esp_timer_get_time()-last_hold_check >= HOLD_CHECK_US) {
+        last_hold_check=esp_timer_get_time();
+        if (!healthy(true) || tmc_read(0x6C)!=CHOPCONF) {
+            reason="FAULT"; ready=false;
+        }
+    }
+    if (reason) {
+        release_output(); pending=false; jogging=false; stop_requested=true;
+        printf("HOLD OFF %s\n", reason); status();
+    }
+}
+
+static unsigned preset_scaler(const char *cmd, unsigned *ma)
+{
+    // Exact whitelist avoids malformed or out-of-range numeric arguments.
+    if (!strcmp(cmd,"CURRENT 500"))  { *ma=500;  return 41; }
+    if (!strcmp(cmd,"CURRENT 1000")) { *ma=1000; return 83; }
+    if (!strcmp(cmd,"CURRENT 1500")) { *ma=1500; return 125; }
+    if (!strcmp(cmd,"CURRENT 2000")) { *ma=2000; return MAX_GLOBALSCALER; }
+    return 0;
+}
+
+static void report_current(void)
+{
+    printf("CURRENT %u\n", current_ma);
 }
 
 static void command(const char *cmd)
 {
     if (!strcmp(cmd,"HELLO")) {
-        printf("HELLO RMT_GUI_V2\n"); status();
+        printf("HELLO RMT_GUI_V3_1\n"); if (ready) report_current(); status();
     } else if (!strcmp(cmd,"PING")) {
+        // A delayed heartbeat must not revive a timed-out active output.
+        if ((busy || pending || hold_mode) && !link_alive()) {
+            release_output(); stop_requested=true; pending=false;
+            if (!busy) { jogging=false; printf("HOLD OFF LINK_TIMEOUT\n"); status(); }
+        }
         last_ping = esp_timer_get_time();
         printf("PONG\n");
     } else if (!strcmp(cmd,"JKEEP")) {
-        if (jogging && (busy || pending) && !stop_requested &&
+        if (jogging && (busy || pending) && !stop_requested && !jog_stop_requested &&
             esp_timer_get_time()-last_jog_keep <= JOG_TIMEOUT_US)
             last_jog_keep = esp_timer_get_time();
     } else if (!strcmp(cmd,"STATUS")) {
         status();
+    } else if (!strncmp(cmd,"CURRENT",7)) {
+        unsigned ma=0;
+        unsigned scaler=preset_scaler(cmd,&ma);
+        if (scaler<32U || scaler>MAX_GLOBALSCALER) { printf("ERR CURRENT_RANGE\n"); return; }
+        if (!ready || busy || pending || hold_mode) { printf("ERR CURRENT_STATE\n"); return; }
+        if (!link_alive() || gpio_get_level(PIN_BOOT)==0) { printf("ERR CURRENT_INTERLOCK\n"); return; }
+        if (!healthy(false) || tmc_read(0x6C)!=CHOPCONF) {
+            release_output(); ready=false; printf("ERR CURRENT_FAULT\n"); status(); return;
+        }
+        // EN stays HIGH throughout; no output while changing the current.
+        tmc_write(0x0B, scaler);
+        if (!healthy(false)) {
+            release_output(); ready=false; printf("ERR CURRENT_FAULT\n"); status(); return;
+        }
+        current_scaler=scaler; current_ma=ma;
+        report_current(); status();
+    } else if (!strcmp(cmd,"HOLD")) {
+        // Explicit arming only; never energize automatically after reset or fault.
+        if (!ready || busy || pending || hold_mode) { printf("ERR HOLD_STATE\n"); return; }
+        if (!link_alive() || gpio_get_level(PIN_BOOT)==0) { printf("ERR HOLD_INTERLOCK\n"); return; }
+        if (!healthy(false) || tmc_read(0x6C)!=CHOPCONF) {
+            release_output(); ready=false; printf("ERR HOLD_FAULT\n"); status(); return;
+        }
+        gpio_set_level(PIN_EN,0);
+        if (!healthy(true)) {
+            release_output(); ready=false; printf("ERR HOLD_FAULT\n"); status(); return;
+        }
+        hold_mode=true; stop_requested=false; jog_stop_requested=false;
+        last_hold_check=esp_timer_get_time();
+        printf("OK HOLD\n"); status();
+    } else if (!strcmp(cmd,"JSTOP")) {
+        // Normal jog release: no more STEP pulses after the current RMT block.
+        // Never overrides STOP, BOOT, heartbeat timeout or a fault.
+        if (jogging && (busy || pending) && !stop_requested) {
+            jog_stop_requested=true;
+            if (!busy) { pending=false; jogging=false; }
+        }
+        printf("OK JSTOP\n");
+        if (!busy) status();
     } else if (!strcmp(cmd,"STOP")) {
-        stop_requested = true; pending = false;
-        gpio_set_level(PIN_EN, 1);
+        stop_requested = true; pending = false; jog_stop_requested=false;
+        release_output();
         printf("OK STOP\n");
         if (!busy) { jogging=false; status(); }
     } else if (!strcmp(cmd,"INIT")) {
-        if (busy || pending) { printf("ERR BUSY\n"); return; }
+        if (busy || pending || hold_mode) { printf("ERR BUSY_OR_HOLD\n"); return; }
         gpio_set_level(PIN_EN, 1);
         if (rmt_created) {
             // RMT owns STEP after initialization; never rerun GPIO pin test on it.
             if (ready && healthy(false) && tmc_read(0x6C) == CHOPCONF) {
-                printf("OK INIT\n"); status();
+                printf("OK INIT\n"); report_current(); status();
             } else { ready=false; printf("ERR RESET_REQUIRED\n"); status(); }
             return;
         }
         direction=0; sent=0; total_pulses=0;
         ready = tmc_init();
         if (ready) { rmt_init(); rmt_created=true; ready=healthy(false); }
-        if (ready) printf("OK INIT\n"); else printf("ERR INIT_FAILED\n");
+        if (ready) { printf("OK INIT\n"); report_current(); } else printf("ERR INIT_FAILED\n");
         status();
     } else {
         int a=0, per, d; char extra;
@@ -265,12 +364,12 @@ static void command(const char *cmd)
         }
         if (gpio_get_level(PIN_BOOT)==0) { printf("ERR BOOT_HELD\n"); return; }
         angle_deg=(unsigned)a; period_us=(uint32_t)per;
-        // Set the new direction in move_once, after disabling output.
+        // Set the new direction before issuing any STEP pulses.
         requested_direction=(unsigned)d;
         jogging=jog_cmd;
         last_jog_keep=esp_timer_get_time();
         total_pulses=jogging ? 0 : (PPR*angle_deg+180U)/360U;
-        sent=0; stop_requested=false; pending=true;
+        sent=0; stop_requested=false; jog_stop_requested=false; pending=true;
     }
 }
 
@@ -306,32 +405,39 @@ static bool wait_motion_ms(unsigned ms)
     int64_t end = esp_timer_get_time() + (int64_t)ms * 1000;
     do {
         poll_usb();
-        if (abort_requested()) return false;
+        if (abort_requested() || jog_stop_requested) return false;
         vTaskDelay(1);
     } while (esp_timer_get_time() < end);
     poll_usb();
-    return !abort_requested();
+    return !abort_requested() && !jog_stop_requested;
 }
 
 static const char *move_once(void)
 {
     rmt_transmit_config_t cfg = {.loop_count = 0, .flags.eot_level = 0};
-    gpio_set_level(PIN_EN, 1);
+    // Keep EN low between movements when holding, to avoid a torque gap.
+    if (abort_requested()) return "STOPPED";
+    if (jog_stop_requested) return "JOG_DONE";
+    if (!hold_mode) gpio_set_level(PIN_EN, 1);
     direction=requested_direction;
     gpio_set_level(PIN_DIR, direction);
-    if (!wait_motion_ms(20)) return "STOPPED";
-    if (!healthy(false) || tmc_read(0x6C)!=CHOPCONF) { ready=false; return "FAULT"; }
+    if (!wait_motion_ms(20)) return abort_requested() ? "STOPPED" : "JOG_DONE";
+    if (!healthy(hold_mode) || tmc_read(0x6C)!=CHOPCONF) { ready=false; return "FAULT"; }
     if (abort_requested()) return "STOPPED";
-    gpio_set_level(PIN_EN, 0);
-    if (!wait_motion_ms(200)) return "STOPPED";
+    if (!hold_mode) {
+        gpio_set_level(PIN_EN, 0);
+        if (!wait_motion_ms(200)) return abort_requested() ? "STOPPED" : "JOG_DONE";
+    }
     poll_usb();
     if (abort_requested()) return "STOPPED";
+    if (jog_stop_requested) return "JOG_DONE";
     if (!healthy(true)) { ready=false; return "FAULT"; }
     printf("START %u %" PRIu32 " %" PRIu32 " %u\n", angle_deg,total_pulses,period_us,direction);
     int64_t last_report=esp_timer_get_time();
     while (jogging || sent < total_pulses) {
         poll_usb();
         if (abort_requested()) return "STOPPED";
+        if (jog_stop_requested) return "JOG_DONE";
         if (!healthy(true)) { ready=false; return "FAULT"; }
         uint32_t n;
         if (jogging) {
@@ -367,14 +473,23 @@ void app_main(void)
     checked(usb_serial_jtag_driver_install(&usb_cfg));
     usb_serial_jtag_vfs_use_driver();
     spi_init();
-    printf("HELLO RMT_GUI_V2\n");
+    printf("HELLO RMT_GUI_V3_1\n");
     while(1) {
+        monitor_hold();
         poll_usb();
+        monitor_hold();
         if (pending) {
             pending=false; busy=true;
             const char *result=move_once();
-            gpio_set_level(PIN_EN,1);
-            busy=false; jogging=false;
+            // Check again after the final RMT block before retaining torque.
+            bool normal = !strcmp(result,"DONE") || !strcmp(result,"JOG_DONE");
+            if (normal && abort_requested()) { result="STOPPED"; normal=false; }
+            if (normal && hold_mode) {
+                if (!healthy(true) || tmc_read(0x6C)!=CHOPCONF) {
+                    ready=false; result="FAULT"; release_output();
+                } else last_hold_check=esp_timer_get_time();
+            } else release_output();
+            busy=false; jogging=false; jog_stop_requested=false;
             printf("END %s %" PRIu32 "\n",result,sent);
             status();
         }

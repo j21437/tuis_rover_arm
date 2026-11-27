@@ -12,8 +12,8 @@ PPR = 80000
 class App:
     def __init__(self, root):
         self.root = root
-        root.title('TMC5160 RMT Motor Test | 25:1 | V2.2')
-        root.geometry('660x780')
+        root.title('TMC5160 RMT Motor Test | 25:1 | V3.1 CURRENT')
+        root.geometry('720x880')
         self.s = None
         self.buf = bytearray()
         self.link = False
@@ -52,7 +52,21 @@ class App:
         self.angle.trace_add('write',self.calc); self.rpm.trace_add('write',self.calc); self.calc()
         b=ttk.Frame(f); b.pack(fill='x')
         self.go=ttk.Button(b,text='回転開始',command=self.move); self.go.pack(side='left',expand=True,fill='x')
-        self.stop_btn=tk.Button(b,text='stop/停止',bg='#a92323',fg='white',command=self.stop); self.stop_btn.pack(side='left',expand=True,fill='x',padx=(8,0))
+        self.stop_btn=tk.Button(b,text='STOP / 励磁解除',bg='#a92323',fg='white',command=self.stop); self.stop_btn.pack(side='left',expand=True,fill='x',padx=(8,0))
+        h=ttk.LabelFrame(f,text='負荷試験：位置保持',padding=8); h.pack(fill='x',pady=(8,0))
+        self.current_choice=tk.StringVar(value='0.5')
+        self.current_info=tk.StringVar(value='電流設定：未確認')
+        cr=ttk.Frame(h); cr.pack(fill='x',pady=(0,4))
+        ttk.Label(cr,text='回転・保持電流 (A RMS)').pack(side='left')
+        self.current_combo=ttk.Combobox(cr,textvariable=self.current_choice,values=('0.5','1.0','1.5','2.0'),width=5,state='readonly')
+        self.current_combo.pack(side='left',padx=5)
+        self.current_btn=ttk.Button(cr,text='電流を適用',command=self.apply_current); self.current_btn.pack(side='left')
+        ttk.Label(h,textvariable=self.current_info).pack(anchor='w')
+        self.hold_btn=ttk.Button(h,text='位置保持 ON（設定電流）',command=self.enable_hold)
+        self.hold_btn.pack(fill='x')
+        self.hold_status=tk.StringVar(value='保持OFF')
+        ttk.Label(h,textvariable=self.hold_status,font=('',11,'bold')).pack(anchor='w')
+        ttk.Label(h,text='通常停止は保持継続。STOP・通信断・異常時は励磁解除。負荷を支持して試験。',wraplength=620).pack(anchor='w')
         j=ttk.LabelFrame(f,text='手動ジョグ操作（押している間だけ回転）',padding=8); j.pack(fill='x',pady=(10,0))
         jr=ttk.Frame(j); jr.pack(fill='x')
         ttk.Checkbutton(jr,text='キーボード操作を有効にする',variable=self.jog_mode,command=self.toggle_jog).pack(side='left')
@@ -101,14 +115,18 @@ class App:
         # Leave Tk's mouse hover and pressed states alone.
         for widget, enabled in (
             (self.connect_btn, self.s is None),
-            (self.init_btn, self.link and self.state != 'MOVING' and not self.waiting and not self.jog_key),
-            (self.go, self.link and self.state == 'READY' and not self.waiting and not self.jog_key),
+            (self.init_btn, self.link and self.state not in ('MOVING','HOLDING') and not self.waiting and not self.jog_key),
+            (self.hold_btn, self.link and self.state == 'READY' and not self.waiting and not self.jog_key),
+            (self.current_btn, self.link and self.state == 'READY' and not self.waiting and not self.jog_key),
+            (self.current_combo, self.link and self.state == 'READY' and not self.waiting and not self.jog_key),
+            (self.go, self.link and self.state in ('READY','HOLDING') and not self.waiting and not self.jog_key),
         ):
             if enabled and widget.instate(['disabled']):
                 widget.state(['!disabled'])
             elif not enabled and widget.instate(['!disabled']):
                 widget.state(['disabled'])
-        ready = bool(self.s and self.link and self.state == 'READY' and not self.waiting and not self.jog_key)
+        self.hold_status.set('HOLDING / 位置保持中' if self.state=='HOLDING' else '回転中（保持状態は停止後に表示）' if self.state=='MOVING' else '保持OFF（通信状態を確認）' if self.s and self.state=='NOT_READY' else '保持OFF / 未確認' if not self.s else '保持OFF')
+        ready = bool(self.s and self.link and self.state in ('READY','HOLDING') and not self.waiting and not self.jog_key)
         for k, button in self.jog_buttons.items():
             active = self.jog_source == 'mouse' and self.jog_key == k
             enabled = ready or active
@@ -151,16 +169,38 @@ class App:
         if s:
             try: s.close()
             except OSError: pass
+        self.current_info.set('電流設定：未確認')
         self.link=False; self.waiting=False; self.state='NOT_READY'; self.status.set('切断 / 動作中なら電源を確認'); self.controls()
     def initialize(self):
         if self.send('INIT'): self.waiting=True; self.wait_until=time.monotonic()+4; self.controls()
     def move(self):
-        if not self.s or not self.link or self.state != 'READY' or self.waiting or self.jog_key:
+        if not self.s or not self.link or self.state not in ('READY','HOLDING') or self.waiting or self.jog_key:
             return
         try: a,p,d=self.params()
         except (ValueError,OverflowError): messagebox.showerror('入力エラー','角度1～360°、速度0.25～5rpm'); return
         if self.send(f'MOVE {a} {p} {d}'):
             self.waiting=True; self.wait_until=time.monotonic()+3; self.status.set('回転指令送信済み / 応答待ち'); self.controls()
+    def apply_current(self):
+        if not self.s or not self.link or self.state!='READY' or self.waiting or self.jog_key:
+            return
+        ma={'0.5':500,'1.0':1000,'1.5':1500,'2.0':2000}.get(self.current_choice.get())
+        if ma is None: return
+        if self.send(f'CURRENT {ma}'):
+            self.current_info.set('電流設定：応答待ち')
+            self.waiting=True; self.wait_until=time.monotonic()+3; self.controls()
+
+    def enable_hold(self):
+        if not self.s or not self.link or self.state!='READY' or self.waiting or self.jog_key:
+            return
+        if self.send('HOLD'):
+            self.waiting=True; self.wait_until=time.monotonic()+3; self.controls()
+
+    def normal_jog_stop(self):
+        if not self.jog_key: return
+        self.clear_jog()
+        if self.send('JSTOP'):
+            self.waiting=True; self.wait_until=time.monotonic()+3; self.controls()
+
     def clear_jog(self):
         self.jog_key=None
         self.jog_source=None
@@ -171,16 +211,22 @@ class App:
         if self.send('STOP'): self.waiting=True; self.wait_until=time.monotonic()+3; self.controls()
     def receive(self,msg):
         if msg!='PONG': self.logline(msg)
-        if msg=='HELLO RMT_GUI_V2':
+        if msg=='HELLO RMT_GUI_V3_1':
             self.link=True; self.last_rx=time.monotonic(); self.status.set('通信OK / 初期化してください'); self.send('STATUS')
         elif msg.startswith('HELLO '):
-            self.logline('ファームウェアのバージョン不一致。V2を書き込んでください。'); self.disconnect()
+            self.logline('ファームウェアのバージョン不一致。V3.1を書き込んでください。'); self.disconnect()
+        elif msg.startswith('CURRENT '):
+            ma=msg.split()[1:]
+            if ma in (['500'],['1000'],['1500'],['2000']):
+                amps=f'{int(ma[0])/1000:.1f}'
+                self.current_choice.set(amps)
+                self.current_info.set(f'適用済み：設定 {amps} A RMS（回転・保持共通、概算）')
         elif msg=='PONG':
             self.last_rx=time.monotonic()
             return
         elif msg.startswith('STATE '):
             parts=msg.split()
-            if len(parts)==4 and parts[1] in ('READY','MOVING','NOT_READY'):
+            if len(parts)==4 and parts[1] in ('READY','HOLDING','MOVING','NOT_READY'):
                 try:
                     n,total=map(int,parts[2:])
                     self.bar['maximum']=max(1,total); self.bar['value']=n if total else 0
@@ -190,10 +236,10 @@ class App:
                 self.state=parts[1]; self.waiting=False
                 if self.state=='NOT_READY' or (previous=='MOVING' and self.state=='READY'):
                     self.clear_jog()
-                self.status.set({'READY':'READY / 回転可能','MOVING':'回転中','NOT_READY':'初期化が必要'}[self.state])
+                self.status.set({'READY':'READY / 回転可能','HOLDING':'HOLDING / 位置保持中','MOVING':'回転中','NOT_READY':'初期化が必要'}[self.state])
         elif msg.startswith('START '): self.state='MOVING'; self.waiting=False; self.status.set('回転中')
         elif msg.startswith('ERR '):
-            if self.jog_key: self.stop()
+            if self.jog_key or self.state in ('HOLDING','MOVING'): self.stop()
             self.waiting=False; self.status.set(msg)
             if self.state!='MOVING': self.state='NOT_READY'
         elif msg.startswith('END '): self.clear_jog(); self.waiting=False; self.status.set(msg); self.state='NOT_READY'
@@ -263,7 +309,7 @@ class App:
         if not self.focus_safe():
             self.logline('ジョグ拒否：入力欄またはウィンドウのフォーカスを確認')
             return False
-        if not self.s or not self.link or self.state!='READY' or self.waiting:
+        if not self.s or not self.link or self.state not in ('READY','HOLDING') or self.waiting:
             self.logline(f'ジョグ拒否：READY待ち (state={self.state}, waiting={self.waiting})')
             return False
         try:
@@ -331,7 +377,9 @@ class App:
 
     def finish_release(self,k):
         self.release_jobs.pop(k,None); self.keys_down.discard(k)
-        if self.jog_source=='keyboard' and self.jog_key==k: self.stop()
+        if self.jog_source=='keyboard' and self.jog_key==k:
+            if not self.jog_mode.get() or not self.focus_safe() or (sys.platform=='win32' and self.blocked_modifiers()): self.stop()
+            else: self.normal_jog_stop()
 
     def mouse_press(self,event,k):
         button=event.widget
@@ -347,7 +395,9 @@ class App:
 
     def mouse_release(self,event):
         if self.jog_source=='mouse':
-            self.stop()
+            # Release on the active button is normal; elsewhere is safety stop.
+            if self.focus_safe() and self.mouse_inside(): self.normal_jog_stop()
+            else: self.stop()
             return 'break'
         if event.widget in self.jog_buttons.values(): return 'break'
 
@@ -355,26 +405,28 @@ class App:
         if self.jog_source=='mouse' and event.widget is self.mouse_button:
             self.stop()
 
-    def mouse_safe(self):
+    def mouse_inside(self):
         b=self.mouse_button
         if b is None or not self.focus_safe() or not b.winfo_viewable(): return False
         x,y=b.winfo_pointerxy()
         return (b.winfo_rootx() <= x < b.winfo_rootx()+b.winfo_width()
-                and b.winfo_rooty() <= y < b.winfo_rooty()+b.winfo_height()
-                and (sys.platform!='win32' or self.mouse_down()))
+                and b.winfo_rooty() <= y < b.winfo_rooty()+b.winfo_height())
 
     def tick(self):
         if sys.platform=='win32':
-            for k in tuple(self.keys_down):
-                if not self.physical_down(k): self.finish_release(k)
-            if self.jog_source=='keyboard' and not self.physical_down(self.jog_key): self.stop()
+            if self.jog_source=='keyboard' and (not self.jog_mode.get() or not self.focus_safe()): self.stop()
             if self.jog_source=='keyboard' and self.blocked_modifiers():
                 self.logline('ジョグ停止：修飾キーが押されました')
                 self.stop()
             if self.jog_key and self.physical_down('a') and self.physical_down('d'): self.stop()
             if self.jog_source=='mouse' and any(self.physical_down(k) for k in ('a','d')): self.stop()
+            for k in tuple(self.keys_down):
+                if not self.physical_down(k): self.finish_release(k)
+            if self.jog_source=='keyboard' and not self.physical_down(self.jog_key): self.normal_jog_stop()
         if self.jog_source=='keyboard' and (not self.jog_mode.get() or not self.focus_safe()): self.stop()
-        if self.jog_source=='mouse' and not self.mouse_safe(): self.stop()
+        if self.jog_source=='mouse':
+            if not self.mouse_inside(): self.stop()
+            elif sys.platform=='win32' and not self.mouse_down(): self.normal_jog_stop()
         if self.s:
             try:
                 now=time.monotonic()
